@@ -119,8 +119,9 @@ if [[ -z "$IP" ]]; then
         SUBNET=$(ip -4 addr show 2>/dev/null | grep -oP 'inet \K[0-9.]+' | grep -v '^127\.' | head -n 1 | sed 's/\.[0-9]*$/.0\/24/')
     fi
 
+    # Probe ports 5555, 80, 443 so Android devices wake up and populate Linux ARP table
     if [[ -n "$SUBNET" ]]; then
-        nmap -sn "$SUBNET" > /dev/null 2>&1
+        nmap -sn -PS5555,80,443 "$SUBNET" > /dev/null 2>&1
     fi
 
     # Broadcast ping fallback
@@ -131,6 +132,19 @@ if [[ -z "$IP" ]]; then
 
     # Check cache again
     IP=$(lookup_ip)
+fi
+
+# 3. Fallback: Check if device hostname (Xiaomi) is discovered if MAC didn't match
+if [[ -z "$IP" ]]; then
+    FALLBACK_LINE=$(arp -a 2>/dev/null | grep -i "Xiaomi" | head -n 1)
+    if [[ -n "$FALLBACK_LINE" ]]; then
+        FALLBACK_IP=$(echo "$FALLBACK_LINE" | grep -oP '\(\K[0-9.]+(?=\))')
+        FALLBACK_MAC=$(echo "$FALLBACK_LINE" | awk '{print $4}')
+        echo ""
+        echo "Found Xiaomi device on network at $FALLBACK_IP (Active MAC: $FALLBACK_MAC)."
+        echo "Note: The tablet is currently using '$FALLBACK_MAC' instead of '$CLEAN_MAC'."
+        IP="$FALLBACK_IP"
+    fi
 fi
 
 if [[ -z "$IP" ]]; then
