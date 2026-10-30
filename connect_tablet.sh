@@ -5,6 +5,24 @@ if [ -z "$BASH_VERSION" ]; then
     exec bash "$0" "$@"
 fi
 
+# Parse command line options
+PAIR_MODE=false
+for arg in "$@"; do
+    case "$arg" in
+        --pair|-p)
+            PAIR_MODE=true
+            ;;
+        --help|-h)
+            echo "Usage: $0 [options]"
+            echo ""
+            echo "Options:"
+            echo "  --pair, -p   Pair with tablet using Android Wireless Debugging pairing code"
+            echo "  --help, -h   Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
 # --- Paths & Environment Setup ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -70,28 +88,70 @@ EOF
 
 install_shortcut
 
-# --- Main Logic ---
+# --- Helper Functions ---
 
-# Prompt if TARGET_MAC is not set
-if [[ -z "$TARGET_MAC" ]]; then
-    read -rp "Enter your tablet's Wi-Fi MAC address (e.g. cc:42:10:b1:7d:61): " TARGET_MAC
-    # Automatically persist to .env if .env exists
-    if [[ -f "$SCRIPT_DIR/.env" ]]; then
-        if grep -q "^TARGET_MAC=" "$SCRIPT_DIR/.env"; then
-            sed -i "s/^TARGET_MAC=.*/TARGET_MAC=\"$TARGET_MAC\"/" "$SCRIPT_DIR/.env"
-        else
-            echo "TARGET_MAC=\"$TARGET_MAC\"" >> "$SCRIPT_DIR/.env"
-        fi
-        echo "Saved MAC address to $SCRIPT_DIR/.env"
-        # Also sync to home env copy
-        cp -f "$SCRIPT_DIR/.env" "$HOME/.connect_tablet.env" 2>/dev/null
+# Function to pair device using Android 11+ pairing code
+pair_device() {
+    local target_ip="$1"
+    echo ""
+    echo "================================================"
+    echo "        Wireless Debugging Device Pairing       "
+    echo "================================================"
+    echo "1. On your tablet, go to Settings -> Developer Options -> Wireless debugging."
+    echo "2. Tap 'Pair device with pairing code'."
+    echo "3. A dialog will show an IP, a 5-digit PORT, and a 6-digit CODE."
+    echo "================================================"
+    echo ""
+    read -rp "Enter the 5-digit pairing PORT (from the popup): " PAIR_PORT
+    read -rp "Enter the 6-digit pairing CODE: " PAIR_CODE
+
+    if [[ -z "$PAIR_PORT" || -z "$PAIR_CODE" ]]; then
+        echo "Pairing cancelled."
+        return 1
     fi
-fi
 
-# Normalize MAC format (lowercase, replace dashes with colons, remove spaces)
-CLEAN_MAC=$(echo "$TARGET_MAC" | tr '[:upper:]' '[:lower:]' | tr '-' ':' | tr -d ' ')
+    echo "Pairing with $target_ip:$PAIR_PORT..."
+    local pair_result
+    pair_result=$(adb pair "$target_ip:$PAIR_PORT" "$PAIR_CODE" 2>&1)
+    echo "$pair_result"
 
-echo "Looking for tablet with MAC: $CLEAN_MAC..."
+    if echo "$pair_result" | grep -qi "successfully paired"; then
+        echo ""
+        echo "Device successfully paired!"
+        echo "Now look at the main Wireless Debugging screen on your tablet."
+        read -rp "Enter the connection PORT shown there (press Enter if $ADB_PORT): " NEW_PORT
+        if [[ -n "$NEW_PORT" ]]; then
+            ADB_PORT="$NEW_PORT"
+            if [[ -f "$SCRIPT_DIR/.env" ]]; then
+                sed -i "s/^ADB_PORT=.*/ADB_PORT=\"$ADB_PORT\"/" "$SCRIPT_DIR/.env"
+                cp -f "$SCRIPT_DIR/.env" "$HOME/.connect_tablet.env" 2>/dev/null
+            fi
+        fi
+        return 0
+    else
+        echo "Pairing was not successful. Please verify the code and port."
+        return 1
+    fi
+}
+
+# Function to connect and launch scrcpy
+connect_and_launch() {
+    local target_ip="$1"
+    local port="${ADB_PORT:-5555}"
+
+    echo "Connecting to $target_ip:$port..."
+    local connect_result
+    connect_result=$(adb connect "$target_ip:$port" 2>&1)
+    echo "$connect_result"
+
+    if echo "$connect_result" | grep -qi "connected"; then
+        echo "Connected successfully! Launching scrcpy..."
+        scrcpy -s "$target_ip:$port"
+        return 0
+    else
+        return 1
+    fi
+}
 
 # Function to lookup IP from ARP / neighbor cache
 lookup_ip() {
@@ -106,6 +166,27 @@ lookup_ip() {
     echo "$ip"
 }
 
+# --- Main Logic ---
+
+# Prompt if TARGET_MAC is not set
+if [[ -z "$TARGET_MAC" ]]; then
+    read -rp "Enter your tablet's Wi-Fi MAC address (e.g. cc:42:10:b1:7d:61): " TARGET_MAC
+    if [[ -f "$SCRIPT_DIR/.env" ]]; then
+        if grep -q "^TARGET_MAC=" "$SCRIPT_DIR/.env"; then
+            sed -i "s/^TARGET_MAC=.*/TARGET_MAC=\"$TARGET_MAC\"/" "$SCRIPT_DIR/.env"
+        else
+            echo "TARGET_MAC=\"$TARGET_MAC\"" >> "$SCRIPT_DIR/.env"
+        fi
+        echo "Saved MAC address to $SCRIPT_DIR/.env"
+        cp -f "$SCRIPT_DIR/.env" "$HOME/.connect_tablet.env" 2>/dev/null
+    fi
+fi
+
+# Normalize MAC format (lowercase, replace dashes with colons, remove spaces)
+CLEAN_MAC=$(echo "$TARGET_MAC" | tr '[:upper:]' '[:lower:]' | tr '-' ':' | tr -d ' ')
+
+echo "Looking for tablet with MAC: $CLEAN_MAC..."
+
 # 1. Try finding in cache first (instant)
 IP=$(lookup_ip)
 
@@ -113,24 +194,20 @@ IP=$(lookup_ip)
 if [[ -z "$IP" ]]; then
     echo "Device not in ARP cache. Scanning network..."
 
-    # Determine subnet (e.g. 192.168.1.0/24)
     SUBNET=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$/.0\/24/')
     if [[ -z "$SUBNET" ]]; then
         SUBNET=$(ip -4 addr show 2>/dev/null | grep -oP 'inet \K[0-9.]+' | grep -v '^127\.' | head -n 1 | sed 's/\.[0-9]*$/.0\/24/')
     fi
 
-    # Probe ports 5555, 80, 443 so Android devices wake up and populate Linux ARP table
     if [[ -n "$SUBNET" ]]; then
         nmap -sn -PS5555,80,443 "$SUBNET" > /dev/null 2>&1
     fi
 
-    # Broadcast ping fallback
     BROADCAST_IP=$(ip -4 addr show 2>/dev/null | grep -oP 'brd \K[0-9.]+' | head -n 1)
     if [[ -n "$BROADCAST_IP" ]]; then
         ping -b -c 1 -W 1 "$BROADCAST_IP" > /dev/null 2>&1
     fi
 
-    # Check cache again
     IP=$(lookup_ip)
 fi
 
@@ -158,9 +235,23 @@ if [[ -z "$IP" ]]; then
 fi
 
 echo "Found tablet at IP: $IP"
-echo "Connecting and launching scrcpy..."
-if [[ "$ADB_PORT" == "5555" || -z "$ADB_PORT" ]]; then
-    scrcpy --tcpip="$IP"
-else
-    scrcpy --tcpip="$IP:$ADB_PORT"
+
+# If --pair flag was given, pair first
+if [[ "$PAIR_MODE" == "true" ]]; then
+    pair_device "$IP"
+fi
+
+# Attempt connection
+if ! connect_and_launch "$IP"; then
+    echo ""
+    echo "Connection failed."
+    read -rp "Would you like to pair using a pairing code now? [y/N]: " WANT_PAIR
+    if [[ "$WANT_PAIR" =~ ^[Yy]$ ]]; then
+        if pair_device "$IP"; then
+            connect_and_launch "$IP"
+        fi
+    else
+        echo "Make sure Wireless Debugging is enabled on the tablet and ADB_PORT in .env is correct."
+        exit 1
+    fi
 fi
