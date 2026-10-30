@@ -1,0 +1,13 @@
+# Configuration with personal MAC address
+.env
+*.env
+!.env.example
+
+# Temporary / editor files
+*~
+*.swp
+*.swo
+
+# OS artifacts
+.DS_Store
+Thumbs.db
