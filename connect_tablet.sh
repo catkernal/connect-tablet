@@ -90,7 +90,7 @@ install_shortcut
 
 # --- Helper Functions ---
 
-# Function to pair device using Android 11+ pairing code
+# Function to pair device using Android 11+ pairing code (only when explicitly requested)
 pair_device() {
     local target_ip="$1"
     echo ""
@@ -118,15 +118,6 @@ pair_device() {
     if echo "$pair_result" | grep -qi "successfully paired"; then
         echo ""
         echo "Device successfully paired!"
-        echo "Now look at the main Wireless Debugging screen on your tablet."
-        read -rp "Enter the connection PORT shown there (press Enter if $ADB_PORT): " NEW_PORT
-        if [[ -n "$NEW_PORT" ]]; then
-            ADB_PORT="$NEW_PORT"
-            if [[ -f "$SCRIPT_DIR/.env" ]]; then
-                sed -i "s/^ADB_PORT=.*/ADB_PORT=\"$ADB_PORT\"/" "$SCRIPT_DIR/.env"
-                cp -f "$SCRIPT_DIR/.env" "$HOME/.connect_tablet.env" 2>/dev/null
-            fi
-        fi
         return 0
     else
         echo "Pairing was not successful. Please verify the code and port."
@@ -134,17 +125,47 @@ pair_device() {
     fi
 }
 
+# Auto-detect active Wireless Debugging / ADB port on the target IP
+find_active_adb_port() {
+    local target_ip="$1"
+
+    # 1. Check if adb is already connected to this IP on any port
+    local existing_device
+    existing_device=$(adb devices 2>/dev/null | grep "^$target_ip:" | grep -w "device" | head -n 1 | awk '{print $1}')
+    if [[ -n "$existing_device" ]]; then
+        echo "${existing_device#*:}"
+        return 0
+    fi
+
+    # 2. Check if default 5555 or configured ADB_PORT is open
+    local candidate_port="${ADB_PORT:-5555}"
+    if nc -z -w 1 "$target_ip" "$candidate_port" 2>/dev/null; then
+        echo "$candidate_port"
+        return 0
+    fi
+
+    # 3. Quickly scan Android Wireless Debugging dynamic port range (30000-50000)
+    local detected_port
+    detected_port=$(nmap -sT --open -p 5555,30000-50000 "$target_ip" 2>/dev/null | awk -F'/' '/\/tcp open/{print $1}' | head -n 1)
+    if [[ -n "$detected_port" ]]; then
+        echo "$detected_port"
+        return 0
+    fi
+
+    echo "${ADB_PORT:-5555}"
+}
+
 # Function to connect and launch scrcpy
 connect_and_launch() {
     local target_ip="$1"
-    local port="${ADB_PORT:-5555}"
+    local port="$2"
 
     echo "Connecting to $target_ip:$port..."
     local connect_result
     connect_result=$(adb connect "$target_ip:$port" 2>&1)
     echo "$connect_result"
 
-    if echo "$connect_result" | grep -qi "connected"; then
+    if echo "$connect_result" | grep -qi -E "connected|already connected"; then
         echo "Connected successfully! Launching scrcpy..."
         scrcpy -s "$target_ip:$port"
         return 0
@@ -219,7 +240,6 @@ if [[ -z "$IP" ]]; then
         FALLBACK_MAC=$(echo "$FALLBACK_LINE" | awk '{print $4}')
         echo ""
         echo "Found Xiaomi device on network at $FALLBACK_IP (Active MAC: $FALLBACK_MAC)."
-        echo "Note: The tablet is currently using '$FALLBACK_MAC' instead of '$CLEAN_MAC'."
         IP="$FALLBACK_IP"
     fi
 fi
@@ -236,22 +256,20 @@ fi
 
 echo "Found tablet at IP: $IP"
 
-# If --pair flag was given, pair first
+# If --pair flag was passed explicitly, run pairing
 if [[ "$PAIR_MODE" == "true" ]]; then
     pair_device "$IP"
 fi
 
+# Automatically find active ADB port on tablet
+PORT=$(find_active_adb_port "$IP")
+echo "Detected active Wireless Debugging port: $PORT"
+
 # Attempt connection
-if ! connect_and_launch "$IP"; then
+if ! connect_and_launch "$IP" "$PORT"; then
     echo ""
     echo "Connection failed."
-    read -rp "Would you like to pair using a pairing code now? [y/N]: " WANT_PAIR
-    if [[ "$WANT_PAIR" =~ ^[Yy]$ ]]; then
-        if pair_device "$IP"; then
-            connect_and_launch "$IP"
-        fi
-    else
-        echo "Make sure Wireless Debugging is enabled on the tablet and ADB_PORT in .env is correct."
-        exit 1
-    fi
+    echo "If this is the first time connecting, run with --pair to pair once:"
+    echo "  ./connect_tablet.sh --pair"
+    exit 1
 fi
