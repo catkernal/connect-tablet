@@ -90,7 +90,7 @@ install_shortcut
 
 # --- Helper Functions ---
 
-# Function to pair device using Android 11+ pairing code (only when explicitly requested)
+# Function to pair device using Android 11+ pairing code
 pair_device() {
     local target_ip="$1"
     echo ""
@@ -117,7 +117,7 @@ pair_device() {
 
     if echo "$pair_result" | grep -qi "successfully paired"; then
         echo ""
-        echo "Device successfully paired!"
+        echo "Device successfully paired! It is now saved in your tablet's paired devices."
         return 0
     else
         echo "Pairing was not successful. Please verify the code and port."
@@ -268,8 +268,15 @@ echo "Detected active Wireless Debugging port: $PORT"
 # Attempt connection
 if ! connect_and_launch "$IP" "$PORT"; then
     echo ""
-    echo "Connection failed."
-    echo "If this is the first time connecting, run with --pair to pair once:"
-    echo "  ./connect_tablet.sh --pair"
-    exit 1
+    echo "Connection failed (device is not paired or port changed)."
+    read -rp "Would you like to re-pair with a pairing code now? [y/N]: " REPAIR
+    if [[ "$REPAIR" =~ ^[Yy]$ ]]; then
+        if pair_device "$IP"; then
+            PORT=$(find_active_adb_port "$IP")
+            connect_and_launch "$IP" "$PORT"
+        fi
+    else
+        echo "To pair later, run: ./connect_tablet.sh --pair"
+        exit 1
+    fi
 fi
